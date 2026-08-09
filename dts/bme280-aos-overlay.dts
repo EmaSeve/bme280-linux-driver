@@ -1,0 +1,23 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target = <&i2c1>;
+
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            status = "okay";
+
+            bme280@76 {
+                compatible = "aos,bme280-test";
+                reg = <0x76>;
+                status = "okay";
+            };
+        };
+    };
+};
