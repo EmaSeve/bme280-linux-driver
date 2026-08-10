@@ -17,7 +17,7 @@ static void bme280_remove(struct i2c_client *client) {
 }
 
 static const struct of_device_id bme280_aos_of_match[] = {
-    {.compatible = "aos,bme280-test" },
+    {.compatible = "aos,bme280-aos" },
     {}
 };
 

@@ -14,7 +14,7 @@
             status = "okay";
 
             bme280@76 {
-                compatible = "aos,bme280-test";
+                compatible = "aos,bme280-aos";
                 reg = <0x76>;
                 status = "okay";
             };
