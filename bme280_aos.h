@@ -1,12 +1,27 @@
+#define MODE_SLEEP         0x00
+#define MODE_FORCED        0x01
+#define MODE_NORMAL        0x03
 
-#define BME280_REG_CHIP_ID 0xD0
-#define BME280_CHIP_ID 0x60
+#define REG_CTRL_HUM       0xF2
+#define REG_STATUS         0xF3
+#define REG_CTRL_MEAS      0xF4
+#define REG_CONFIG         0xF5
+#define REG_RAW_DATA       0xF7
 
-#define BME280_REG_CALIB1	0x88
-#define BME280_CALIB1_LEN	26
+#define RAW_DATA_LEN 8
 
-#define BME280_REG_CALIB2	0xE1
-#define BME280_CALIB2_LEN	7
+#define T_OVRSMPL_BITS    0x01
+#define P_OVRSMPL_BITS    0x01
+#define H_OVRSMPL_BITS    0x01
+
+#define REG_CHIP_ID 0xD0
+#define CHIP_ID 0x60
+
+#define REG_CALIB1	0x88
+#define CALIB1_LEN	26
+
+#define REG_CALIB2	0xE1
+#define CALIB2_LEN	7
 
 /*
  * BME280 calibration register layout
@@ -85,6 +100,11 @@ struct bme280_calib {
 struct bme280_data {
 	struct i2c_client *client;
 	struct bme280_calib calib;
+    struct mutex lock;    
 };
-
+struct raw_data {
+    u32 pressure;
+    u32 temperature;
+    u16 humidity;
+}; 
 
