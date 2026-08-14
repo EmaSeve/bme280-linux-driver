@@ -102,9 +102,16 @@ struct bme280_data {
 	struct bme280_calib calib;
     struct mutex lock;    
 };
-struct raw_data {
+
+struct bme280_raw_sample {
     u32 pressure;
     u32 temperature;
     u16 humidity;
 }; 
+
+struct bme280_sample {
+    s32 temperature;
+    u32 pressure;
+    u32 humidity;
+};
 

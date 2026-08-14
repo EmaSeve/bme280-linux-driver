@@ -30,7 +30,130 @@ static s16 sign_extend_12(u16 value) {
 	return (s16)value;
 }
 
-static int bme280_read_raw_measurement(struct bme280_data *data, struct raw_data *raw) {
+static s32 bme280_compensate_temperature(struct bme280_data *data,
+                                         s32 adc_temp,
+                                         s32 *t_fine) {
+    const struct bme280_calib *calib = &data->calib;
+    s32 var1;
+    s32 var2;
+    s32 delta;
+
+    var1 = (((adc_temp >> 3) - ((s32)calib->t1 << 1)) *
+            (s32)calib->t2) >> 11;
+
+    delta = (adc_temp >> 4) - (s32)calib->t1;
+
+    var2 = (((delta * delta) >> 12) *
+            (s32)calib->t3) >> 14;
+
+    *t_fine = var1 + var2;
+
+    return (*t_fine * 5 + 128) >> 8;
+}
+
+static u32 bme280_compensate_pressure(struct bme280_data *data,
+                                      s32 adc_press,
+                                      s32 t_fine) {
+    const struct bme280_calib *calib = &data->calib;
+    s64 x;
+    s64 x2;
+    s64 offset;
+    s64 sensitivity;
+    s64 corr_quad;
+    s64 corr_lin;
+    s64 p;
+
+    x = (s64)t_fine - 128000;
+    x2 = x * x;
+
+    /* Pressure offset compensation */
+    offset = x2 * (s64)calib->p6;
+    offset += (x * (s64)calib->p5) << 17;
+    offset += (s64)calib->p4 << 35;
+
+    /* Pressure sensitivity compensation */
+    sensitivity = (x2 * (s64)calib->p3) >> 8;
+    sensitivity += (x * (s64)calib->p2) << 12;
+    sensitivity = ((((s64)1 << 47) + sensitivity) *
+                   (s64)calib->p1) >> 33;
+
+    if (sensitivity == 0)
+        return 0;
+
+    /* Pressure calculation */
+    p = (s64)1048576 - adc_press;
+    p = (((p << 31) - offset) * 3125) / sensitivity;
+
+    /* Nonlinear corrections */
+    corr_quad = ((s64)calib->p9 *
+                 (p >> 13) * (p >> 13)) >> 25;
+
+    corr_lin = ((s64)calib->p8 * p) >> 19;
+
+    p = ((p + corr_quad + corr_lin) >> 8) +
+        ((s64)calib->p7 << 4);
+
+    return (u32)p;
+}
+
+static u32 bme280_compensate_humidity(struct bme280_data *data,
+                                      s32 adc_hum,
+                                      s32 t_fine) {
+    const struct bme280_calib *calib = &data->calib;
+    s32 x;
+    s32 adc_corr;
+    s32 term1;
+    s32 term2a;
+    s32 term2b;
+    s32 gain;
+    s32 nonlinear;
+    s32 h;
+
+    x = t_fine - 76800;
+
+    /* Correct raw humidity using H4 and H5 */
+    adc_corr = (adc_hum << 14) -
+               ((s32)calib->h4 << 20) -
+               ((s32)calib->h5 * x) +
+               16384;
+
+    term1 = adc_corr >> 15;
+
+    /* Temperature-dependent humidity gain */
+    term2a = (x * (s32)calib->h6) >> 10;
+    term2b = ((x * (s32)calib->h3) >> 11) + 32768;
+
+    gain = ((term2a * term2b) >> 10) + 2097152;
+    gain = (gain * (s32)calib->h2 + 8192) >> 14;
+
+    h = term1 * gain;
+
+    /* Nonlinear correction */
+    nonlinear = (((((h >> 15) * (h >> 15)) >> 7) *
+                  (s32)calib->h1) >> 4);
+
+    h -= nonlinear;
+
+    /* Clamp to physical range */
+    if (h < 0)
+        h = 0;
+    else if (h > 419430400)
+        h = 419430400;
+
+    return (u32)(h >> 12);
+}
+
+static void bme280_compensate(struct bme280_data *data,
+                              const struct bme280_raw_sample *raw,
+                              struct bme280_sample *sample) {
+	s32 t_fine;
+	sample->temperature = bme280_compensate_temperature(data, raw->temperature, &t_fine);
+	sample->pressure = bme280_compensate_pressure(data, raw->pressure, t_fine);
+	sample->humidity = bme280_compensate_humidity(data, raw->humidity, t_fine);
+}
+
+static int bme280_read_measurement(struct bme280_data *data, 
+                                       struct bme280_raw_sample *raw) {
     u8 buf[RAW_DATA_LEN];
     int ret;
 
@@ -101,7 +224,8 @@ static int bme280_trigger_measurement(struct bme280_data *data) {
     return i2c_smbus_write_byte_data(data->client, REG_CTRL_MEAS, ctrl_meas); 
 }
 
-static int bme280_take_measurement(struct bme280_data *data, struct raw_data *raw) {
+static int bme280_acquire_raw_measurement(struct bme280_data *data, 
+                                   struct bme280_raw_sample *raw) {
     int ret;
 
     mutex_lock(&data->lock);
@@ -112,7 +236,7 @@ static int bme280_take_measurement(struct bme280_data *data, struct raw_data *ra
     ret = bme280_wait_measurement(data);
     if (ret < 0) goto out;
 
-    ret = bme280_read_raw_measurement(data, raw);
+    ret = bme280_read_measurement(data, raw);
 
 out:
     mutex_unlock(&data->lock);
@@ -233,7 +357,8 @@ static int bme280_probe(struct i2c_client *client) {
    
     struct bme280_data *data;
     s32 chip_id;
-    struct raw_data raw;
+    struct bme280_raw_sample raw;
+    struct bme280_sample sample;
     int ret;
 
     /* Check functions support */
@@ -274,14 +399,17 @@ static int bme280_probe(struct i2c_client *client) {
     if (ret < 0) return ret;
 
     /* Take measurement */
-    ret = bme280_take_measurement(data, &raw);
+    ret = bme280_acquire_raw_measurement(data, &raw);
     if (ret < 0) return ret;
 
+    /* Compute final value of Temperature, Pressure and Humidity */
+    bme280_compensate(data, &raw, &sample);
+
     dev_info(&client->dev,
-         "raw: temp=%u pressure=%u humidity=%u\n",
-         raw.temperature,
-         raw.pressure,
-         raw.humidity);
+         "Temperature=%d centi-C, Pressure=%u Pa, Humidity=%u milli-%%RH\n",
+         sample.temperature,
+         sample.pressure >> 8,
+         (sample.humidity * 1000) >> 10);
 
     return 0;
 }
