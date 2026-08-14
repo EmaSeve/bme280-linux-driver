@@ -5,6 +5,8 @@
 #include <linux/jiffies.h>
 #include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/iio/iio.h>
+#include <linux/bitops.h>
 #include "bme280_aos.h"
 
 #define BME280_DRV_NAME "bme280-aos"
@@ -348,68 +350,140 @@ static s32 bme280_read_chip_id(struct i2c_client *client) {
     return chip_id;
 }
 
+static const struct iio_chan_spec bme280_iio_channels[] = {
+    {
+        .type = IIO_TEMP,
+        .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+    },
+    {
+        .type = IIO_PRESSURE,
+        .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+    },
+    {
+        .type = IIO_HUMIDITYRELATIVE,
+        .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+    },
+};
+
+static int bme280_iio_read_raw(struct iio_dev *indio_dev,
+                               const struct iio_chan_spec *chan,
+                               int *val,
+                               int *val2,
+                               long mask) {
+    struct bme280_data *data = iio_priv(indio_dev);
+    struct bme280_raw_sample raw;
+    struct bme280_sample sample;
+    int ret;
+
+    if (mask != IIO_CHAN_INFO_PROCESSED)
+        return -EINVAL;
+
+    ret = bme280_acquire_raw_measurement(data, &raw);
+    if (ret < 0)
+        return ret;
+
+    bme280_compensate(data, &raw, &sample);
+
+    switch (chan->type) {
+    case IIO_TEMP:
+        /*
+         * sample.temperature is in centi-C.
+         * IIO temperature input uses milli-C.
+         */
+        *val = sample.temperature * 10;
+        return IIO_VAL_INT;
+
+    case IIO_PRESSURE:
+        /*
+         * sample.pressure is Q24.8 Pa.
+         *
+         * pressure [kPa] =
+         * sample.pressure / (256 * 1000)
+         */
+        *val = sample.pressure;
+        *val2 = 256000;
+        return IIO_VAL_FRACTIONAL;
+
+    case IIO_HUMIDITYRELATIVE:
+        /*
+         * sample.humidity is Q22.10 %RH.
+         * IIO humidity input uses milli-%RH.
+         */
+        *val = (sample.humidity * 1000) >> 10;
+        return IIO_VAL_INT;
+
+    default:
+        return -EINVAL;
+    }
+}
+
+static const struct iio_info bme280_iio_info = {
+    .read_raw = bme280_iio_read_raw,
+};
+
 static int bme280_probe(struct i2c_client *client) {
+    struct iio_dev *indio_dev;
+    struct bme280_data *data;
+    s32 chip_id;
+    int ret;
+
     /* */
     dev_info(&client->dev,
              "probe() called: address=0x%02x, adapter=%d\n",
              client->addr,
              i2c_adapter_id(client->adapter));
-   
-    struct bme280_data *data;
-    s32 chip_id;
-    struct bme280_raw_sample raw;
-    struct bme280_sample sample;
-    int ret;
-
+    
     /* Check functions support */
-    if (!i2c_check_functionality(client->adapter, 
-            I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_READ_I2C_BLOCK)) {
-        	dev_err(&client->dev, "Required I2C/SMBus functionality not supported\n");
-	        return -EOPNOTSUPP;
+    if (!i2c_check_functionality(client->adapter,
+            I2C_FUNC_SMBUS_BYTE_DATA |
+            I2C_FUNC_SMBUS_READ_I2C_BLOCK)) {
+        dev_err(&client->dev,
+                "Required I2C/SMBus functionality not supported\n");
+        return -EOPNOTSUPP;
     }
 
     /* Check that device chip ID is correct */
     chip_id = bme280_read_chip_id(client);
-    if(chip_id < 0) 
+    if (chip_id < 0)
         return chip_id;
+
     dev_info(&client->dev,
-            "BME280 detected, chip ID: 0x%02x\n",
-            chip_id);
+             "BME280 detected, chip ID: 0x%02x\n",
+             chip_id);
 
-    /* Read sensor calibration data */
+    /* Allocate the IIO device and the private driver data */
+    indio_dev = devm_iio_device_alloc(&client->dev, sizeof(*data));
+    if (!indio_dev)
+        return -ENOMEM;
 
-    // devm_ binds the memory allocated to &client->dev: memory is deallocated
-    // when driver disconnects.
-    data = devm_kzalloc(&client->dev, sizeof(*data), GFP_KERNEL);
-    if(!data) return -ENOMEM;
-    
+    data = iio_priv(indio_dev);
     data->client = client;
     mutex_init(&data->lock);
-    // Set specific data related to the device, that will be used later
-    i2c_set_clientdata(client, data);
-    
+    i2c_set_clientdata(client, indio_dev);
+
+    /* Read sensor calibration data */
     ret = bme280_read_calibration(data);
     if (ret < 0) {
         dev_err(&client->dev, "Failed to read calibration data\n");
         return ret;
     }
-    
+
     /* Configure measurement mode */
     ret = bme280_configure(data);
-    if (ret < 0) return ret;
+    if (ret < 0)
+        return ret;
+    
+    /* confiure and register iio_dev */
+    indio_dev->name = BME280_DRV_NAME;
+    indio_dev->info = &bme280_iio_info;
+    indio_dev->modes = INDIO_DIRECT_MODE;
+    indio_dev->channels = bme280_iio_channels;
+    indio_dev->num_channels = ARRAY_SIZE(bme280_iio_channels);
 
-    /* Take measurement */
-    ret = bme280_acquire_raw_measurement(data, &raw);
-    if (ret < 0) return ret;
-
-    /* Compute final value of Temperature, Pressure and Humidity */
-    bme280_compensate(data, &raw, &sample);
-
-    dev_info(&client->dev,
-         "Temperature=%d centi-C, Pressure=%u Pa, Humidity=%u milli-%%RH\n",
-         sample.temperature,
-         sample.pressure >> 8,
-         (sample.humidity * 1000) >> 10);
+    ret = devm_iio_device_register(&client->dev, indio_dev);
+    if (ret < 0)
+        return dev_err_probe(&client->dev, ret,
+                             "Failed to register IIO device\n");
 
     return 0;
 }
