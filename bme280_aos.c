@@ -11,10 +11,6 @@
 
 #define BME280_DRV_NAME "bme280-aos"
 
-#define T_OVRSMPL_FACTOR  1
-#define P_OVRSMPL_FACTOR  1
-#define H_OVRSMPL_FACTOR  1
-
 #define POLL_MIN_US 500
 #define POLL_MAX_US 1000
 
@@ -30,6 +26,19 @@ static s16 sign_extend_12(u16 value) {
 		value |= 0xF000;
 
 	return (s16)value;
+}
+
+/* Converts the oversampling factor to the bits representation
+ * used to set the sensor */
+static int osr_to_bits(unsigned int osr) {
+    switch(osr) {
+        case 1: return 0x01;
+        case 2: return 0x02;
+        case 4: return 0x03;
+        case 8: return 0x04;
+        case 16: return 0x05;
+        default: return 0;
+    }
 }
 
 static s32 bme280_compensate_temperature(struct bme280_data *data,
@@ -177,29 +186,29 @@ static int bme280_wait_measurement(struct bme280_data *data) {
     unsigned long residual_timeout_ms = 3;
     int status;
 
-    /*
-     * Measurement time depends on the oversampling settings.
+    unsigned int osr_temperature = data->osr_temperature;
+    unsigned int osr_pressure = data->osr_pressure;
+    unsigned int osr_humidity = data->osr_humidity;
+    /* Measurement time depends on the oversampling settings.
      * From BME280 datasheet:
      *
      * t_meas_typ [ms] = 1 + 2 * T_oversampling + (2 * P_oversampling + 0.5)
      *                  + (2 * H_oversampling + 0.5)
      *
      * t_meas_max [ms] = 1.25 + 2.3 * T_oversampling + (2.3 * P_oversampling + 0.575)
-     *                  + (2.3 * H_oversampling + 0.575)
+     *                  + (2.3 * H_oversampling + 0.575) 
      */
-    typical_meas_time_us = 1000 + 2000 * T_OVRSMPL_FACTOR + (2000 * P_OVRSMPL_FACTOR + 500) +
-                         (2000 * H_OVRSMPL_FACTOR + 500);
+    typical_meas_time_us = 1000 + 2000 * osr_temperature + (2000 * osr_pressure + 500) +
+                         (2000 * osr_humidity + 500);
 
-    max_meas_time_us = 1250 + 2300 * T_OVRSMPL_FACTOR + (2300 * P_OVRSMPL_FACTOR + 575) +
-                         (2300 * H_OVRSMPL_FACTOR + 575);
+    max_meas_time_us = 1250 + 2300 * osr_temperature + (2300 * osr_pressure + 575) +
+                         (2300 * osr_humidity + 575);
 
     timeout = jiffies + msecs_to_jiffies(DIV_ROUND_UP(max_meas_time_us, 1000) + 
                                         residual_timeout_ms);
 
-    /*
-     * Sleep for the typical conversion time first, then poll
-     * the status register until the measurement completes.
-     */
+    /* Sleep for the typical conversion time first, then poll
+     * the status register until the measurement completes. */
     fsleep(typical_meas_time_us);
 
     u8 status_busy = (1<<3) | 1; // 00001001
@@ -208,9 +217,9 @@ static int bme280_wait_measurement(struct bme280_data *data) {
         if (status < 0)
             return status;
 
-        // Sensor correctly executed the measure
+        // Measurement done correctly, exit.
         if (!(status & status_busy))
-            return 0;
+            return 0;  
 
         usleep_range(POLL_MIN_US, POLL_MAX_US);
 
@@ -221,7 +230,9 @@ static int bme280_wait_measurement(struct bme280_data *data) {
 
 /* Switch to forced mode */
 static int bme280_trigger_measurement(struct bme280_data *data) {
-    u8 ctrl_meas = (T_OVRSMPL_BITS<<5) | (P_OVRSMPL_BITS<<2) | MODE_FORCED;
+    int osr_bit_temperature = osr_to_bits(data->osr_temperature);
+    int osr_bit_pressure = osr_to_bits(data->osr_pressure);
+    u8 ctrl_meas = (osr_bit_temperature<<5) | (osr_bit_pressure<<2) | MODE_FORCED;
 
     return i2c_smbus_write_byte_data(data->client, REG_CTRL_MEAS, ctrl_meas); 
 }
@@ -250,15 +261,25 @@ static int bme280_configure(struct bme280_data *data) {
     struct i2c_client *client = data->client;
     int ret;
     
+    int osr_bit_temperature = osr_to_bits(data->osr_temperature);
+    int osr_bit_pressure = osr_to_bits(data->osr_pressure);
+    int osr_bit_humidity = osr_to_bits(data->osr_humidity);
+
+    // Check if it's a possible oversampling factor
+    if (!osr_bit_temperature || !osr_bit_pressure || !osr_bit_humidity)
+            return -EINVAL;
+
+    // Filter disable
+    int config = 0x00;
     /* Disable IIR filter and 3-wire SPI.
     * Standby time is irrelevant in forced mode. */
-    ret = i2c_smbus_write_byte_data(client, REG_CONFIG, 0x00); 
+    ret = i2c_smbus_write_byte_data(client, REG_CONFIG, config); 
     if (ret < 0) return ret;
 
     /* Humidity oversampling (0, 1, 2, 4, 8, 16)
      * Warning: changes to this register become effective only after
      * a write operation to ctrl_meas. */
-    ret = i2c_smbus_write_byte_data(client, REG_CTRL_HUM, H_OVRSMPL_BITS);
+    ret = i2c_smbus_write_byte_data(client, REG_CTRL_HUM, osr_bit_humidity);
     if (ret < 0) return ret;
 
     /* CTRL_MEAS register layout:
@@ -267,7 +288,7 @@ static int bme280_configure(struct bme280_data *data) {
     *        -----------+-----------+-------
     *       temp_ovrsmp |pres_ovrsmp | mode
     */
-    u8 ctrl_meas = (T_OVRSMPL_BITS<<5) | (P_OVRSMPL_BITS<<2) | MODE_SLEEP; 
+    u8 ctrl_meas = (osr_bit_temperature<<5) | (osr_bit_pressure<<2) | MODE_SLEEP; 
     ret = i2c_smbus_write_byte_data(client, REG_CTRL_MEAS, ctrl_meas);  
     if (ret < 0) return ret;
 
@@ -340,10 +361,7 @@ static s32 bme280_read_chip_id(struct i2c_client *client) {
 
     /* Check if the discovered device is the one inteded by the driver */
     if (chip_id != CHIP_ID) {
-        dev_err(&client->dev, 
-                "Unexpected chip ID: 0x%02x\n",
-                chip_id);
-
+        dev_err(&client->dev, "Unexpected chip ID: 0x%02x\n", chip_id);
         return -ENODEV;
     }
     
@@ -351,17 +369,37 @@ static s32 bme280_read_chip_id(struct i2c_client *client) {
 }
 
 static const struct iio_chan_spec bme280_iio_channels[] = {
-    {
+    {   // Channel measurement type 
         .type = IIO_TEMP,
-        .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+
+        // Declares the attributes exposed by this channel.
+        // Their current values are retrieved through the read_raw() callback.
+        .info_mask_separate =
+            BIT(IIO_CHAN_INFO_PROCESSED) |
+            BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
+
+        // - Supported oversampling ratios are common to all channels -
+        // Declares which channel attributes expose a set of supported values.
+        // The supported values are retrieved through the read_avail() callback.
+        .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
     },
     {
         .type = IIO_PRESSURE,
-        .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+        
+        .info_mask_separate = 
+            BIT(IIO_CHAN_INFO_PROCESSED) | 
+            BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
+        
+        .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
     },
     {
         .type = IIO_HUMIDITYRELATIVE,
-        .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+        
+        .info_mask_separate = 
+            BIT(IIO_CHAN_INFO_PROCESSED) | 
+            BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
+        
+        .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
     },
 };
 
@@ -375,41 +413,61 @@ static int bme280_iio_read_raw(struct iio_dev *indio_dev,
     struct bme280_sample sample;
     int ret;
 
-    if (mask != IIO_CHAN_INFO_PROCESSED)
-        return -EINVAL;
+    switch(mask) {
+    case IIO_CHAN_INFO_PROCESSED:
+        ret = bme280_acquire_raw_measurement(data, &raw);
+        if (ret < 0) return ret;
 
-    ret = bme280_acquire_raw_measurement(data, &raw);
-    if (ret < 0)
-        return ret;
+        bme280_compensate(data, &raw, &sample);
 
-    bme280_compensate(data, &raw, &sample);
+        switch (chan->type) {
+        case IIO_TEMP:
+            /* sample.temperature is in centi-C.
+            * IIO temperature input uses milli-C. */
+            *val = sample.temperature * 10;
+            return IIO_VAL_INT;
 
-    switch (chan->type) {
-    case IIO_TEMP:
-        /*
-         * sample.temperature is in centi-C.
-         * IIO temperature input uses milli-C.
-         */
-        *val = sample.temperature * 10;
-        return IIO_VAL_INT;
+        case IIO_PRESSURE:
+            /* sample.pressure is Q24.8 Pa.
+            * pressure [kPa] =
+            * sample.pressure / (256 * 1000) */
+            *val = sample.pressure;
+            *val2 = 256000;
+            return IIO_VAL_FRACTIONAL;
 
-    case IIO_PRESSURE:
-        /*
-         * sample.pressure is Q24.8 Pa.
-         *
-         * pressure [kPa] =
-         * sample.pressure / (256 * 1000)
-         */
-        *val = sample.pressure;
-        *val2 = 256000;
-        return IIO_VAL_FRACTIONAL;
+        case IIO_HUMIDITYRELATIVE:
+            /* sample.humidity is Q22.10 %RH.
+            * IIO humidity input uses milli-%RH. */
+            *val = (sample.humidity * 1000) >> 10;
+            return IIO_VAL_INT;
 
-    case IIO_HUMIDITYRELATIVE:
-        /*
-         * sample.humidity is Q22.10 %RH.
-         * IIO humidity input uses milli-%RH.
-         */
-        *val = (sample.humidity * 1000) >> 10;
+        default:
+            return -EINVAL;
+        }
+
+    // Return the current oversampling ratio for this channel. 
+    case IIO_CHAN_INFO_OVERSAMPLING_RATIO:
+        mutex_lock(&data->lock);
+        switch(chan->type) {
+        case IIO_TEMP:
+            *val = data->osr_temperature;
+            break;
+
+        case IIO_PRESSURE:
+            *val = data->osr_pressure;
+            break;
+
+        case IIO_HUMIDITYRELATIVE:
+            *val = data->osr_humidity;
+            break;
+        
+        default:
+            mutex_unlock(&data->lock);
+            return -EINVAL;
+        }
+
+        mutex_unlock(&data->lock);
+
         return IIO_VAL_INT;
 
     default:
@@ -417,8 +475,78 @@ static int bme280_iio_read_raw(struct iio_dev *indio_dev,
     }
 }
 
+static int bme280_iio_write_raw(struct iio_dev *indio_dev, 
+                                const struct iio_chan_spec *chan,
+                                int val,
+                                int val2,
+                                long mask){
+    if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO || val2!=0 || !osr_to_bits(val)) 
+        return -EINVAL;
+   
+    struct bme280_data *data = iio_priv(indio_dev);
+    int ret;
+    unsigned int *osr;
+    unsigned int old_osr;
+
+    // Serialize configuration changes with measurement acquisition
+    mutex_lock(&data->lock);
+
+    switch(chan->type) {
+    case IIO_TEMP:
+        osr = &data->osr_temperature;
+        break;
+    case IIO_PRESSURE:
+        osr = &data->osr_pressure;
+        break;
+    case IIO_HUMIDITYRELATIVE:
+        osr = &data->osr_humidity;
+        break;
+    default: 
+        mutex_unlock(&data->lock);
+        return -EINVAL;
+    }
+    
+    old_osr = *osr;
+    *osr = val;
+
+    ret = bme280_configure(data);
+    if (ret < 0) {
+        *osr = old_osr;
+
+        if (bme280_configure(data) < 0)
+            dev_err(&data->client->dev, "Failed to restore previous configuration\n");
+    }
+
+    mutex_unlock(&data->lock);
+
+    return ret;
+}
+
+static const int bme280_osr_available[] = {
+    1, 2, 4, 8, 16
+};
+
+static int bme280_iio_read_avail(struct iio_dev *indio_dev,
+                                 const struct iio_chan_spec *chan,
+                                 const int **vals,
+                                 int *type,
+                                 int *length,
+                                 long mask)
+{
+    if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO)
+        return -EINVAL;
+
+    *vals = bme280_osr_available;
+    *type = IIO_VAL_INT;
+    *length = ARRAY_SIZE(bme280_osr_available);
+
+    return IIO_AVAIL_LIST;
+}
+
 static const struct iio_info bme280_iio_info = {
     .read_raw = bme280_iio_read_raw,
+    .write_raw = bme280_iio_write_raw,
+    .read_avail = bme280_iio_read_avail,
 };
 
 static int bme280_probe(struct i2c_client *client) {
@@ -444,17 +572,13 @@ static int bme280_probe(struct i2c_client *client) {
 
     /* Check that device chip ID is correct */
     chip_id = bme280_read_chip_id(client);
-    if (chip_id < 0)
-        return chip_id;
+    if (chip_id < 0) return chip_id;
 
-    dev_info(&client->dev,
-             "BME280 detected, chip ID: 0x%02x\n",
-             chip_id);
+    dev_info(&client->dev, "BME280 detected, chip ID: 0x%02x\n", chip_id);
 
     /* Allocate the IIO device and the private driver data */
     indio_dev = devm_iio_device_alloc(&client->dev, sizeof(*data));
-    if (!indio_dev)
-        return -ENOMEM;
+    if (!indio_dev) return -ENOMEM;
 
     data = iio_priv(indio_dev);
     data->client = client;
@@ -468,22 +592,26 @@ static int bme280_probe(struct i2c_client *client) {
         return ret;
     }
 
-    /* Configure measurement mode */
+    /* Initialize the default sensor configuration:
+    * - temperature, pressure and humidity oversampling: x1
+    * - IIR filter disabled
+    * - sleep mode between forced measurements */
+    data->osr_temperature = 1;
+    data->osr_pressure = 1;
+    data->osr_humidity = 1;
     ret = bme280_configure(data);
-    if (ret < 0)
-        return ret;
+    if (ret < 0) return ret;
     
-    /* confiure and register iio_dev */
+    /* Configure and register iio_dev */
     indio_dev->name = BME280_DRV_NAME;
     indio_dev->info = &bme280_iio_info;
     indio_dev->modes = INDIO_DIRECT_MODE;
     indio_dev->channels = bme280_iio_channels;
     indio_dev->num_channels = ARRAY_SIZE(bme280_iio_channels);
-
+    
     ret = devm_iio_device_register(&client->dev, indio_dev);
     if (ret < 0)
-        return dev_err_probe(&client->dev, ret,
-                             "Failed to register IIO device\n");
+        return dev_err_probe(&client->dev, ret, "Failed to register IIO device\n");
 
     return 0;
 }
