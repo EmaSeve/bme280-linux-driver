@@ -37,7 +37,7 @@ static int osr_to_bits(unsigned int osr) {
         case 4: return 0x03;
         case 8: return 0x04;
         case 16: return 0x05;
-        default: return 0;
+        default: return -1;
     }
 }
 
@@ -266,7 +266,7 @@ static int bme280_configure(struct bme280_data *data) {
     int osr_bit_humidity = osr_to_bits(data->osr_humidity);
 
     // Check if it's a possible oversampling factor
-    if (!osr_bit_temperature || !osr_bit_pressure || !osr_bit_humidity)
+    if ((osr_bit_temperature==-1) || (osr_bit_pressure==-1) || (osr_bit_humidity==-1))
             return -EINVAL;
 
     // Filter disable
@@ -480,7 +480,7 @@ static int bme280_iio_write_raw(struct iio_dev *indio_dev,
                                 int val,
                                 int val2,
                                 long mask){
-    if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO || val2!=0 || !osr_to_bits(val)) 
+    if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO || val2!=0 || (osr_to_bits(val)==-1)) 
         return -EINVAL;
    
     struct bme280_data *data = iio_priv(indio_dev);
