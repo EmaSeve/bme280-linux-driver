@@ -101,7 +101,14 @@ struct bme280_data {
 	struct i2c_client *client;
 	struct bme280_calib calib;
     struct mutex lock;    
-    
+
+    struct task_struct *task;
+
+    int buffered_mode;
+
+    unsigned int filter;
+    unsigned int standby_us;
+
     // Oversampling factor
     unsigned int osr_temperature;
     unsigned int osr_pressure;
@@ -120,3 +127,9 @@ struct bme280_sample {
     u32 humidity;
 };
 
+struct bme280_scan {
+    s32 temperature;
+    u32 pressure;
+    u32 humidity;
+    s64 timestamp __aligned(8);
+};

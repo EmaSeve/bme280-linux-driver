@@ -7,6 +7,9 @@
 #include <linux/delay.h>
 #include <linux/iio/iio.h>
 #include <linux/bitops.h>
+#include <linux/kthread.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/kfifo_buf.h>
 #include "bme280_aos.h"
 
 #define BME280_DRV_NAME "bme280-aos"
@@ -32,18 +35,41 @@ static s16 sign_extend_12(u16 value) {
  * used to set the sensor */
 static int osr_to_bits(unsigned int osr) {
     switch(osr) {
-        case 1: return 0x01;
-        case 2: return 0x02;
-        case 4: return 0x03;
-        case 8: return 0x04;
-        case 16: return 0x05;
-        default: return -1;
+    case 1: return 0x01;
+    case 2: return 0x02;
+    case 4: return 0x03;
+    case 8: return 0x04;
+    case 16: return 0x05;
+    default: return -EINVAL;
     }
 }
 
-static s32 bme280_compensate_temperature(struct bme280_data *data,
-                                         s32 adc_temp,
-                                         s32 *t_fine) {
+static int filter_to_bits(unsigned int filter) {
+    switch (filter) {
+    case 0:  return 0x00;
+    case 2:  return 0x01;
+    case 4:  return 0x02;
+    case 8:  return 0x03;
+    case 16: return 0x04;
+    default: return -EINVAL;
+    }
+}
+
+static int standby_to_bits(unsigned int standby_us) {
+    switch (standby_us) {
+    case 500:     return 0x00;
+    case 62500:   return 0x01;
+    case 125000:  return 0x02;
+    case 250000:  return 0x03;
+    case 500000:  return 0x04;
+    case 1000000: return 0x05;
+    case 10000:   return 0x06;
+    case 20000:   return 0x07;
+    default:       return -EINVAL;
+    }
+}
+
+static s32 bme280_compensate_temperature(struct bme280_data *data, s32 adc_temp, s32 *t_fine) {
     const struct bme280_calib *calib = &data->calib;
     s32 var1;
     s32 var2;
@@ -62,9 +88,7 @@ static s32 bme280_compensate_temperature(struct bme280_data *data,
     return (*t_fine * 5 + 128) >> 8;
 }
 
-static u32 bme280_compensate_pressure(struct bme280_data *data,
-                                      s32 adc_press,
-                                      s32 t_fine) {
+static u32 bme280_compensate_pressure(struct bme280_data *data, s32 adc_press, s32 t_fine) {
     const struct bme280_calib *calib = &data->calib;
     s64 x;
     s64 x2;
@@ -107,9 +131,7 @@ static u32 bme280_compensate_pressure(struct bme280_data *data,
     return (u32)p;
 }
 
-static u32 bme280_compensate_humidity(struct bme280_data *data,
-                                      s32 adc_hum,
-                                      s32 t_fine) {
+static u32 bme280_compensate_humidity(struct bme280_data *data, s32 adc_hum, s32 t_fine) {
     const struct bme280_calib *calib = &data->calib;
     s32 x;
     s32 adc_corr;
@@ -179,47 +201,48 @@ static int bme280_read_measurement(struct bme280_data *data,
     return 0;
 }
 
-static int bme280_wait_measurement(struct bme280_data *data) {
+/* Measurement time depends on the oversampling settings.
+ * From BME280 datasheet:
+ *
+ * t_meas_typ [ms] = 1 + 2 * T_oversampling + (2 * P_oversampling + 0.5)
+ *                  + (2 * H_oversampling + 0.5)
+ */
+static unsigned long typical_measurement_time_us(struct bme280_data *data) {
+    return 1000 + 2000 * data->osr_temperature + (2000 * data->osr_pressure + 500) +
+           (2000 * data->osr_humidity + 500);
+}
+
+/* Measurement time depends on the oversampling settings.
+ * From BME280 datasheet:
+ *
+ * t_meas_max [ms] = 1.25 + 2.3 * T_oversampling + (2.3 * P_oversampling + 0.575)
+ *                  + (2.3 * H_oversampling + 0.575) 
+ */
+static unsigned long max_measurement_time_us(struct bme280_data *data) {
+    return 1250 + 2300 * data->osr_temperature + (2300 * data->osr_pressure + 575) +
+           (2300 * data->osr_humidity + 575);
+}
+
+/* Poll REG_STATUS until the measuring bit reaches the requested state.
+ * target = true waits for a measurement to start, while target = false
+ * waits for a measurement to complete. */
+static int wait_measure_register(struct bme280_data *data,
+                                 bool target,
+                                 unsigned long timeout_ms) {
     unsigned long timeout;
-    unsigned long typical_meas_time_us;
-    unsigned long max_meas_time_us;
-    unsigned long residual_timeout_ms = 3;
     int status;
 
-    unsigned int osr_temperature = data->osr_temperature;
-    unsigned int osr_pressure = data->osr_pressure;
-    unsigned int osr_humidity = data->osr_humidity;
-    /* Measurement time depends on the oversampling settings.
-     * From BME280 datasheet:
-     *
-     * t_meas_typ [ms] = 1 + 2 * T_oversampling + (2 * P_oversampling + 0.5)
-     *                  + (2 * H_oversampling + 0.5)
-     *
-     * t_meas_max [ms] = 1.25 + 2.3 * T_oversampling + (2.3 * P_oversampling + 0.575)
-     *                  + (2.3 * H_oversampling + 0.575) 
-     */
-    typical_meas_time_us = 1000 + 2000 * osr_temperature + (2000 * osr_pressure + 500) +
-                         (2000 * osr_humidity + 500);
+    timeout = jiffies + msecs_to_jiffies(timeout_ms);
 
-    max_meas_time_us = 1250 + 2300 * osr_temperature + (2300 * osr_pressure + 575) +
-                         (2300 * osr_humidity + 575);
-
-    timeout = jiffies + msecs_to_jiffies(DIV_ROUND_UP(max_meas_time_us, 1000) + 
-                                        residual_timeout_ms);
-
-    /* Sleep for the typical conversion time first, then poll
-     * the status register until the measurement completes. */
-    fsleep(typical_meas_time_us);
-
-    u8 status_busy = (1<<3) | 1; // 00001001
     do {
+        
         status = i2c_smbus_read_byte_data(data->client, REG_STATUS);
         if (status < 0)
             return status;
 
-        // Measurement done correctly, exit.
-        if (!(status & status_busy))
-            return 0;  
+        /* REG_STATUS bit 3 indicates whether a measurement is in progress. */
+        if (!!(status & BIT(3)) == target)
+            return 0;
 
         usleep_range(POLL_MIN_US, POLL_MAX_US);
 
@@ -228,13 +251,44 @@ static int bme280_wait_measurement(struct bme280_data *data) {
     return -ETIMEDOUT;
 }
 
+/* Wait for a MODE_FORCED measurement to complete.
+ * Sleep for the typical conversion time first, then poll REG_STATUS
+ * for the remaining time up to the maximum expected conversion time. */
+static int bme280_wait_measurement(struct bme280_data *data) {
+    unsigned long timeout_ms;
+    unsigned long typical_meas_time_us;
+    unsigned long max_meas_time_us;
+    unsigned long residual_timeout_ms = 3;
+
+    typical_meas_time_us = typical_measurement_time_us(data);
+    max_meas_time_us = max_measurement_time_us(data); 
+
+    timeout_ms = DIV_ROUND_UP(max_meas_time_us - typical_meas_time_us, 1000) 
+                + residual_timeout_ms;
+
+    fsleep(typical_meas_time_us);
+    
+    return wait_measure_register(data, false, timeout_ms);
+}
+
+static u8 build_ctrl_meas(struct bme280_data *data, u8 mode) {
+    u8 osr_bit_temperature = osr_to_bits(data->osr_temperature);
+    u8 osr_bit_pressure = osr_to_bits(data->osr_pressure);
+    
+    return (osr_bit_temperature<<5) | (osr_bit_pressure<<2) | mode;
+}
+
+/* Switch sensor mode: write to 'ctrl_meas' register */
+static int set_mode(struct bme280_data *data, u8 mode){
+    u8 ctrl_meas = build_ctrl_meas(data, mode);
+
+    return i2c_smbus_write_byte_data(data->client, REG_CTRL_MEAS, ctrl_meas);
+}
+
 /* Switch to forced mode */
 static int bme280_trigger_measurement(struct bme280_data *data) {
-    int osr_bit_temperature = osr_to_bits(data->osr_temperature);
-    int osr_bit_pressure = osr_to_bits(data->osr_pressure);
-    u8 ctrl_meas = (osr_bit_temperature<<5) | (osr_bit_pressure<<2) | MODE_FORCED;
 
-    return i2c_smbus_write_byte_data(data->client, REG_CTRL_MEAS, ctrl_meas); 
+    return set_mode(data, MODE_FORCED); 
 }
 
 static int bme280_acquire_raw_measurement(struct bme280_data *data, 
@@ -243,9 +297,15 @@ static int bme280_acquire_raw_measurement(struct bme280_data *data,
 
     mutex_lock(&data->lock);
 
+    /* This function works only in MODE_FORCED. */
+    if (data->buffered_mode) {
+        ret = -EBUSY;
+        goto out;
+    }
+
     ret = bme280_trigger_measurement(data);
     if (ret < 0) goto out;
-
+ 
     ret = bme280_wait_measurement(data);
     if (ret < 0) goto out;
 
@@ -259,42 +319,55 @@ out:
 
 static int bme280_configure(struct bme280_data *data) {
     struct i2c_client *client = data->client;
+    int buffered_mode = data->buffered_mode;
+
     int ret;
-    
-    int osr_bit_temperature = osr_to_bits(data->osr_temperature);
-    int osr_bit_pressure = osr_to_bits(data->osr_pressure);
-    int osr_bit_humidity = osr_to_bits(data->osr_humidity);
+    int ctrl_hum;
+    int config;
+    int filter_bits;
+    int standby_bits;
 
+    /* CONFIG must be written while sleeping. */
+    ret = set_mode(data, MODE_SLEEP);
+    if (ret<0) return ret;
+
+    // WARNING: check parameters validity in the write_raw function
     // Check if it's a possible oversampling factor
-    if ((osr_bit_temperature==-1) || (osr_bit_pressure==-1) || (osr_bit_humidity==-1))
-            return -EINVAL;
+    //if ((osr_bit_temperature<0) || (osr_bit_pressure<0) || (osr_bit_humidity<0))
+      //      return -EINVAL;
 
-    // Filter disable
-    int config = 0x00;
-    /* Disable IIR filter and 3-wire SPI.
-    * Standby time is irrelevant in forced mode. */
+    /* REG_CONFIG register layout: 
+     *
+     * in forced mode filter and standby time is irrelevant.
+     */
+    filter_bits = (buffered_mode) ? filter_to_bits(data->filter) : 0;
+    standby_bits = (buffered_mode) ? standby_to_bits(data->standby_us) : 0;
+    // WARNING: check validity outside (i.e. write_raw()) ?
+    if (filter_bits<0 || standby_bits<0)
+        return -EINVAL;
+    
+    config = (standby_bits << 5) | (filter_bits << 2);
     ret = i2c_smbus_write_byte_data(client, REG_CONFIG, config); 
     if (ret < 0) return ret;
+
 
     /* Humidity oversampling (0, 1, 2, 4, 8, 16)
      * Warning: changes to this register become effective only after
      * a write operation to ctrl_meas. */
-    ret = i2c_smbus_write_byte_data(client, REG_CTRL_HUM, osr_bit_humidity);
+    ctrl_hum = osr_to_bits(data->osr_humidity);
+    ret = i2c_smbus_write_byte_data(client, REG_CTRL_HUM, ctrl_hum);
     if (ret < 0) return ret;
 
     /* CTRL_MEAS register layout:
     *
-    *  bit:   7   6   5 | 4   3   2 | 1   0
-    *        -----------+-----------+-------
-    *       temp_ovrsmp |pres_ovrsmp | mode
-    */
-    u8 ctrl_meas = (osr_bit_temperature<<5) | (osr_bit_pressure<<2) | MODE_SLEEP; 
-    ret = i2c_smbus_write_byte_data(client, REG_CTRL_MEAS, ctrl_meas);  
-    if (ret < 0) return ret;
-
-    return 0;
+    *  bit:   7   6   5 |  4   3   2 | 1   0
+    *        -----------+------------+-------
+    *          osr_temp |osr_pressure| mode
+    *
+    * set_mode() writes the ctrl_meas and set the mode to MODE_SLEEP if the sensor is 
+    * working in MODE_FORCED, otherwise put back MODE_NORMAL. */
+    return set_mode(data, buffered_mode ? MODE_NORMAL : MODE_SLEEP);
 }
-
 
 static int bme280_read_calibration(struct bme280_data *data) {
     struct i2c_client *client = data->client;
@@ -382,6 +455,14 @@ static const struct iio_chan_spec bme280_iio_channels[] = {
         // Declares which channel attributes expose a set of supported values.
         // The supported values are retrieved through the read_avail() callback.
         .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
+    
+        .scan_index = 0,
+        .scan_type = {
+            .sign = 's',
+            .realbits = 32,
+            .storagebits = 32,
+            .endianness = IIO_CPU,
+        }
     },
     {
         .type = IIO_PRESSURE,
@@ -391,6 +472,14 @@ static const struct iio_chan_spec bme280_iio_channels[] = {
             BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
         
         .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
+   
+        .scan_index = 1,
+        .scan_type = {
+            .sign = 'u',
+            .realbits = 32,
+            .storagebits = 32,
+            .endianness = IIO_CPU,
+        }
     },
     {
         .type = IIO_HUMIDITYRELATIVE,
@@ -400,7 +489,166 @@ static const struct iio_chan_spec bme280_iio_channels[] = {
             BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
         
         .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
+    
+        .scan_index = 2,
+        .scan_type = {
+            .sign = 'u',
+            .realbits = 32,
+            .storagebits = 32,
+            .endianness = IIO_CPU,
+        }
     },
+
+    IIO_CHAN_SOFT_TIMESTAMP(3),
+};
+
+/* Read the latest BME280 measurement, compensate the three channels
+ * and push them as a single scan into the IIO buffer. */
+static int bme280_push_sample(struct iio_dev *indio_dev) {
+    struct bme280_data *data = iio_priv(indio_dev);
+    struct bme280_raw_sample raw;
+    struct bme280_sample sample;
+    struct bme280_scan scan = {};
+    int ret;
+
+    mutex_lock(&data->lock);
+
+    ret = bme280_read_measurement(data, &raw);
+    if (ret < 0)
+        goto out;
+
+    bme280_compensate(data, &raw, &sample);
+
+    scan.temperature = sample.temperature * 10; /* milli-C */
+    scan.pressure = DIV_ROUND_CLOSEST(sample.pressure, 256); /* Pa */
+    scan.humidity = (sample.humidity * 1000) >> 10; /* milli-%RH */
+
+out:
+    mutex_unlock(&data->lock);
+
+    if (ret < 0)
+        return ret;
+
+    return iio_push_to_buffers_with_timestamp(indio_dev, &scan, iio_get_time_ns(indio_dev));
+}
+
+/* Wait for the next complete measurement cycle in normal mode.
+ * First wait for the measuring bit to be set, then wait for it to clear,
+ * ensuring that the following read belongs to a newly completed sample. */
+static int bme280_wait_next_measurement(struct bme280_data *data) {
+    unsigned long cycle_timeout_ms;
+    unsigned long measurement_timeout_ms;
+    unsigned long residual_time_ms = 1;
+    unsigned long max_meas_time_us;
+    int ret;
+
+    max_meas_time_us = max_measurement_time_us(data);
+    measurement_timeout_ms = DIV_ROUND_UP(max_meas_time_us, 1000) 
+                           + residual_time_ms;
+
+    cycle_timeout_ms = measurement_timeout_ms 
+                     + DIV_ROUND_UP(data->standby_us, 1000) 
+                     + residual_time_ms;
+
+    /* Wait for the next conversion to start. */
+    ret = wait_measure_register(data, true, cycle_timeout_ms);
+    if (ret < 0)
+        return ret;
+
+    /* Wait for that conversion to finish. */
+    return wait_measure_register(data, false, measurement_timeout_ms);
+}
+
+/* Capture thread used while the IIO buffer is enabled.
+ * In normal mode, wait for each new measurement to complete
+ * and push the resulting T/P/H scan into the IIO software buffer. */
+static int bme280_buffer_thread(void *arg) {
+    struct iio_dev *indio_dev = arg;
+    struct bme280_data *data = iio_priv(indio_dev);
+    int ret;
+
+    while (!kthread_should_stop()) {
+
+        ret = bme280_wait_next_measurement(data);
+        if (ret < 0) {
+            if (kthread_should_stop())
+                break;
+
+            dev_warn(&data->client->dev, "Failed waiting for measurement\n");
+            continue;
+        }
+
+        ret = bme280_push_sample(indio_dev);
+        
+        if (ret == -EBUSY) {
+            dev_dbg(&data->client->dev, "IIO buffer full, sample dropped\n");
+        } else if (ret < 0) {
+            dev_warn(&data->client->dev, "Failed to push buffered sample: %d\n", ret);
+        }
+    }
+
+    return 0;
+}
+
+static int bme280_buffer_enable(struct iio_dev *indio_dev){
+    struct bme280_data *data = iio_priv(indio_dev);
+    int ret;
+
+    mutex_lock(&data->lock);
+    
+    data->buffered_mode = true;
+    ret = bme280_configure(data);
+    
+    mutex_unlock(&data->lock);
+
+    if (ret < 0) goto err;
+
+    data->task = kthread_run(bme280_buffer_thread, indio_dev, "buffer");
+
+    if (IS_ERR(data->task)) {
+        ret = PTR_ERR(data->task);
+        data->task = NULL;
+        goto err;
+    }
+
+    dev_info(&data->client->dev, "IIO buffer enabled, entering normal mode\n");
+    return 0;
+
+err:
+    mutex_lock(&data->lock);
+    
+    data->buffered_mode = false;
+    bme280_configure(data);
+    if (bme280_configure(data) < 0)
+        dev_err(&data->client->dev, "Failed to restore direct configuration\n");
+    
+    mutex_unlock(&data->lock);
+    return ret;
+}
+
+static int bme280_buffer_disable(struct iio_dev *indio_dev){
+    struct bme280_data *data = iio_priv(indio_dev);
+    int ret;
+
+    if (data->task) {
+        kthread_stop(data->task);
+        data->task = NULL;
+    }
+
+    mutex_lock(&data->lock);
+
+    data->buffered_mode = false;
+    ret = bme280_configure(data);
+    
+    mutex_unlock(&data->lock);
+
+    dev_info(&data->client->dev, "IIO buffer disabled, returning to direct mode\n");
+    return ret;
+}
+
+static const struct iio_buffer_setup_ops bme280_buffer_ops = {
+    .postenable = bme280_buffer_enable,
+    .predisable = bme280_buffer_disable,
 };
 
 static int bme280_iio_read_raw(struct iio_dev *indio_dev,
@@ -480,7 +728,7 @@ static int bme280_iio_write_raw(struct iio_dev *indio_dev,
                                 int val,
                                 int val2,
                                 long mask){
-    if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO || val2!=0 || (osr_to_bits(val)==-1)) 
+    if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO || val2!=0 || (osr_to_bits(val)<0)) 
         return -EINVAL;
    
     struct bme280_data *data = iio_priv(indio_dev);
@@ -599,16 +847,27 @@ static int bme280_probe(struct i2c_client *client) {
     data->osr_temperature = 1;
     data->osr_pressure = 1;
     data->osr_humidity = 1;
+    /* Configuration used when iio buffered is enabled */
+    data->filter = 0;
+    data->standby_us = 125000;
+    data->task = NULL;
+    data->buffered_mode = false;
+
+    /* Configure sensor */
     ret = bme280_configure(data);
     if (ret < 0) return ret;
     
-    /* Configure and register iio_dev */
+    /* Register iio_dev */
     indio_dev->name = BME280_DRV_NAME;
     indio_dev->info = &bme280_iio_info;
     indio_dev->modes = INDIO_DIRECT_MODE;
     indio_dev->channels = bme280_iio_channels;
     indio_dev->num_channels = ARRAY_SIZE(bme280_iio_channels);
-    
+
+    // IIO buffer
+    ret = devm_iio_kfifo_buffer_setup(&client->dev, indio_dev, &bme280_buffer_ops);
+    if (ret < 0) return ret;
+
     ret = devm_iio_device_register(&client->dev, indio_dev);
     if (ret < 0)
         return dev_err_probe(&client->dev, ret, "Failed to register IIO device\n");
