@@ -10,5 +10,7 @@ modules.order
 
 .tmp_versions/
 
+userspace/demo
+
 # Device Tree compiled overlays
 *.dtbo
