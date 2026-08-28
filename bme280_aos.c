@@ -89,8 +89,8 @@ static int bme280_configure(struct bme280_data *data) {
 
     /* REG_CONFIG register layout: 
      *
-     * in forced mode filter and standby time is irrelevant.
-     */
+     * Filter and standby are configured by the user for buffered normal mode.
+     * In forced mode this driver keeps the IIR filter and the standby time disabled. */
     filter_bits = (buffered_mode) ? filter_to_bits(data->filter) : 0;
     standby_bits = (buffered_mode) ? standby_to_bits(data->standby_us) : 0;
     // WARNING: check validity outside (i.e. write_raw()) ?
@@ -283,12 +283,13 @@ static int bme280_buffer_enable(struct iio_dev *indio_dev){
     dev_info(&data->client->dev, "IIO buffer enabled, entering normal mode\n");
     return 0;
 
+    int restore_ret;
 err:
     mutex_lock(&data->lock);
     
     data->buffered_mode = false;
-    ret = bme280_configure(data);
-    if (ret < 0)
+    restore_ret = bme280_configure(data);
+    if (restore_ret < 0)
         dev_err(&data->client->dev, "Failed to restore direct configuration\n");
     
     mutex_unlock(&data->lock);
@@ -322,6 +323,115 @@ static const struct iio_buffer_setup_ops bme280_buffer_ops = {
 
 /* ================================= IIO INTERFACE ================================== */
 
+/* Normal mode global attributes */
+
+static const unsigned int bme280_filter_values[] = { 0, 2, 4, 8, 16 };
+static const char * const bme280_filter_items[] = { "0", "2", "4", "8", "16" };
+
+static int bme280_filter_get(struct iio_dev *indio_dev, const struct iio_chan_spec *chan) {
+    struct bme280_data *data = iio_priv(indio_dev);
+    int index;
+
+    mutex_lock(&data->lock);
+    index = filter_to_bits(data->filter);
+    mutex_unlock(&data->lock);
+    return index;
+}
+
+static int bme280_filter_set(struct iio_dev *indio_dev, const struct iio_chan_spec *chan, unsigned int index) {
+    struct bme280_data *data = iio_priv(indio_dev);
+    int ret = 0;
+
+    if (index >= ARRAY_SIZE(bme280_filter_values))
+        return -EINVAL;
+
+    mutex_lock(&data->lock);
+
+    /* Normal-mode configuration cannot change while buffering. */
+    if (data->buffered_mode) {
+        ret = -EBUSY;
+        goto out;
+    }
+
+    /* Store the value only.
+     * It will be applied to the sensor when the buffer is enabled.
+     * Thi avoid using it in forced mode. */
+    data->filter = bme280_filter_values[index];
+
+out:
+    mutex_unlock(&data->lock);
+    return ret;
+}
+
+static const struct iio_enum bme280_filter_enum = {
+    .items = bme280_filter_items,
+    .num_items = ARRAY_SIZE(bme280_filter_items),
+    .get = bme280_filter_get,
+    .set = bme280_filter_set,
+};
+
+static const unsigned int bme280_standby_values[] = { 500, 10000, 20000, 62500, 125000, 250000, 500000, 1000000 };
+static const char * const bme280_standby_items[] = { "500", "10000", "20000", "62500", "125000", "250000", "500000", "1000000" };
+
+static int bme280_standby_get(struct iio_dev *indio_dev, const struct iio_chan_spec *chan) {
+    struct bme280_data *data = iio_priv(indio_dev);
+    int index;
+    int i;
+
+    mutex_lock(&data->lock);
+    index = -EINVAL;
+    for (i = 0; i < ARRAY_SIZE(bme280_standby_values); i++) {
+        if (bme280_standby_values[i] == data->standby_us) {
+            index = i;
+            break;
+        }
+    }
+    mutex_unlock(&data->lock);
+
+    return index;
+}
+
+static int bme280_standby_set(struct iio_dev *indio_dev, const struct iio_chan_spec *chan, unsigned int index) {
+    struct bme280_data *data = iio_priv(indio_dev);
+    int ret = 0;
+
+    if (index >= ARRAY_SIZE(bme280_standby_values))
+        return -EINVAL;
+
+    mutex_lock(&data->lock);
+
+    if (data->buffered_mode) {
+        ret = -EBUSY;
+        goto out;
+    }
+
+    /* Store the value only.
+     * It will be applied when buffered normal mode is enabled. 
+     * It has no meaning in forced mode. */
+    data->standby_us = bme280_standby_values[index];
+
+out:
+    mutex_unlock(&data->lock);
+    return ret;
+}
+
+static const struct iio_enum bme280_standby_enum = {
+    .items = bme280_standby_items,
+    .num_items = ARRAY_SIZE(bme280_standby_items),
+    .get = bme280_standby_get,
+    .set = bme280_standby_set,
+};
+
+static const struct iio_chan_spec_ext_info bme280_ext_info[] = {
+    IIO_ENUM("filter_coefficient", IIO_SHARED_BY_ALL, &bme280_filter_enum),
+    IIO_ENUM_AVAILABLE("filter_coefficient", IIO_SHARED_BY_ALL, &bme280_filter_enum),
+
+    IIO_ENUM("standby_time_us", IIO_SHARED_BY_ALL, &bme280_standby_enum),
+    IIO_ENUM_AVAILABLE("standby_time_us", IIO_SHARED_BY_ALL, &bme280_standby_enum),
+    
+    { }
+};
+
 static const struct iio_chan_spec bme280_iio_channels[] = {
     {   // Channel measurement type 
         .type = IIO_TEMP,
@@ -337,6 +447,8 @@ static const struct iio_chan_spec bme280_iio_channels[] = {
         // The supported values are retrieved through the read_avail() callback.
         .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
     
+        .ext_info = bme280_ext_info,
+
         .scan_index = 0,
         .scan_type = {
             .sign = 's',
@@ -354,6 +466,8 @@ static const struct iio_chan_spec bme280_iio_channels[] = {
         
         .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
    
+        .ext_info = bme280_ext_info,
+
         .scan_index = 1,
         .scan_type = {
             .sign = 'u',
@@ -371,6 +485,8 @@ static const struct iio_chan_spec bme280_iio_channels[] = {
         
         .info_mask_shared_by_all_available = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO),
     
+        .ext_info = bme280_ext_info,
+
         .scan_index = 2,
         .scan_type = {
             .sign = 'u',
@@ -459,17 +575,25 @@ static int bme280_iio_write_raw(struct iio_dev *indio_dev,
                                 const struct iio_chan_spec *chan,
                                 int val,
                                 int val2,
-                                long mask){
-    if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO || val2!=0 || (osr_to_bits(val)<0)) 
-        return -EINVAL;
-   
+                                long mask)
+{
     struct bme280_data *data = iio_priv(indio_dev);
     int ret;
     unsigned int *osr;
     unsigned int old_osr;
 
-    // Serialize configuration changes with measurement acquisition
+    if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO || val2!=0 || (osr_to_bits(val)<0)) 
+        return -EINVAL;
+ 
+    /* Serialize configuration changes with measurement acquisition
+     * and buffer mode transitions. */
     mutex_lock(&data->lock);
+
+    /* Configuration cannot be changed while normal buffered mode is active. */
+    if (data->buffered_mode) {
+        ret = -EBUSY;
+        goto out;
+    }
 
     switch(chan->type) {
     case IIO_TEMP:
@@ -482,8 +606,8 @@ static int bme280_iio_write_raw(struct iio_dev *indio_dev,
         osr = &data->osr_humidity;
         break;
     default: 
-        mutex_unlock(&data->lock);
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
     
     old_osr = *osr;
@@ -497,8 +621,8 @@ static int bme280_iio_write_raw(struct iio_dev *indio_dev,
             dev_err(&data->client->dev, "Failed to restore previous configuration\n");
     }
 
+out:
     mutex_unlock(&data->lock);
-
     return ret;
 }
 

@@ -12,7 +12,14 @@
 #define IIO_DEVICE "/dev/iio:device0"
 
 #define BUFFER_LENGTH 16
-#define DEFAULT_PRINT_PERIOD_MS 2000
+#define DEFAULT_PRINT_PERIOD_MS 1000
+
+#define TEMP_OVERSAMPLING       "2"
+#define PRESSURE_OVERSAMPLING   "4"
+#define HUMIDITY_OVERSAMPLING   "1"
+
+#define FILTER_COEFFICIENT      "2"
+#define STANDBY_TIME_US         "250000"
 
 static volatile sig_atomic_t stop = 0;
 
@@ -131,12 +138,38 @@ static int run_forced_demo(void) {
 
 /* ============================= BUFFER MODE ============================== */
 
-static int configure_buffer(void)
-{
+static int configure_normal_mode(void) {
+    if (write_sysfs(IIO_SYSFS "/in_temp_oversampling_ratio",
+                    TEMP_OVERSAMPLING) < 0)
+        return -1;
+
+    if (write_sysfs(IIO_SYSFS "/in_pressure_oversampling_ratio",
+                    PRESSURE_OVERSAMPLING) < 0)
+        return -1;
+
+    if (write_sysfs(IIO_SYSFS "/in_humidityrelative_oversampling_ratio",
+                    HUMIDITY_OVERSAMPLING) < 0)
+        return -1;
+
+    if (write_sysfs(IIO_SYSFS "/filter_coefficient",
+                    FILTER_COEFFICIENT) < 0)
+        return -1;
+
+    if (write_sysfs(IIO_SYSFS "/standby_time_us",
+                    STANDBY_TIME_US) < 0)
+        return -1;
+
+    return 0;
+}
+
+static int configure_buffer(void) {
     char length[16];
 
     /* Buffer must be disabled while configuring scan elements. */
     if (write_sysfs(IIO_SYSFS "/buffer0/enable", "0") < 0)
+        return -1;
+    
+    if (configure_normal_mode() < 0) 
         return -1;
 
     /* Enable the four scan elements defined by the current driver. */
@@ -164,8 +197,7 @@ static int configure_buffer(void)
 }
 
 
-static int run_buffer_demo(unsigned int print_period_ms)
-{
+static int run_buffer_demo(unsigned int print_period_ms) {
     struct bme280_scan sample;
     int fd;
     ssize_t n;
@@ -188,7 +220,13 @@ static int run_buffer_demo(unsigned int print_period_ms)
     signal(SIGINT, handle_sigint);
 
     printf("Buffered normal mode\n");
-    printf("Buffer length: %d samples\n", BUFFER_LENGTH);
+    printf("--------------------------------\n");
+    printf("Temperature oversampling : x%s\n", TEMP_OVERSAMPLING);
+    printf("Pressure oversampling    : x%s\n", PRESSURE_OVERSAMPLING);
+    printf("Humidity oversampling    : x%s\n", HUMIDITY_OVERSAMPLING);
+    printf("IIR filter coefficient   : %s\n", FILTER_COEFFICIENT);
+    printf("Standby time             : %s us\n", STANDBY_TIME_US);
+    printf("Buffer length            : %d samples\n", BUFFER_LENGTH);
     printf("Printing one sample every %u ms\n\n", print_period_ms);
 
     printf("%-12s %-16s %-16s %-16s\n",
@@ -251,8 +289,7 @@ static int run_buffer_demo(unsigned int print_period_ms)
 }
 
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage:\n");
         printf("  %s forced\n", argv[0]);
